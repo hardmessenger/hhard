@@ -3036,40 +3036,48 @@ function _buildVidnoteEl(msgId, dataUrl){
     }
 
     if(!vid){
+      // Try blob URL first, then fall back to data URL directly
       const blobUrl = getBlobUrl();
+      
       vid = document.createElement('video');
       vid.className = 'msg-vidnote';
       vid.loop = true;
       vid.playsInline = true;
-      vid.muted = false;
+      vid.muted = true; // start muted — required for autoplay in most browsers
       vid.setAttribute('playsinline','');
       vid.setAttribute('webkit-playsinline','');
-      vid.src = blobUrl;
       wrap.insertBefore(vid, play);
       vid.onclick = tog;
       vid.onended = ()=>{ wrap.classList.remove('msg-vidnote-playing'); play.style.display='flex'; };
+
+      // Try sources in order: blob URL → data URL directly
+      const src1 = document.createElement('source');
+      src1.src = blobUrl;
+      // detect mime from dataUrl header
+      const mimeMatch = dataUrl.match(/^data:([^;,]+)/);
+      const detectedMime = mimeMatch ? mimeMatch[1].split(';')[0].split(',')[0] : 'video/webm';
+      // strip codecs from mime for source type (codecs cause issues)
+      const baseMime = detectedMime.replace(/;.*$/,'');
+      src1.type = baseMime;
+      vid.appendChild(src1);
+      
       vid.onerror = ()=>{
-        const code = vid.error?.code;
-        console.error('Video error code:', code, vid.error?.message);
-        // MEDIA_ERR_SRC_NOT_SUPPORTED (4) = format not playable — show download button
-        if(code === 4 || code === 3){
-          wrap.innerHTML = '';
-          wrap.style.cssText += ';display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;background:#1a0505;cursor:pointer;';
-          wrap.innerHTML = '<div style="font-size:26px">📥</div><div style="font-size:9px;color:#aaa;text-align:center;padding:0 10px;">Формат не<br>поддерживается.<br>Нажми чтобы<br>скачать</div>';
-          wrap.onclick = ()=>{ const a=document.createElement('a'); a.href=dataUrl; a.download='video.webm'; a.click(); };
-        }
+        console.error('Video error code:', vid.error?.code, vid.error?.message, 'mime was:', baseMime);
       };
     }
 
     const tryPlay = () => {
-      vid.muted = false;
+      vid.muted = true;
       vid.play()
-        .then(()=>{ wrap.classList.add('msg-vidnote-playing'); play.style.display='none'; })
-        .catch(()=>{
-          vid.muted = true;
-          vid.play()
-            .then(()=>{ wrap.classList.add('msg-vidnote-playing'); play.style.display='none'; })
-            .catch(e=>{ toast('❌ ' + (e.message||'Ошибка воспроизведения')); });
+        .then(()=>{ 
+          wrap.classList.add('msg-vidnote-playing'); 
+          play.style.display='none';
+          // After playing, try to unmute
+          vid.muted = false;
+        })
+        .catch(e=>{ 
+          console.error('play() failed:', e.message);
+          toast('❌ ' + (e.message||'Ошибка воспроизведения'));
         });
     };
 
@@ -3077,8 +3085,19 @@ function _buildVidnoteEl(msgId, dataUrl){
       tryPlay();
     } else {
       vid.addEventListener('canplay', tryPlay, {once:true});
-      vid.addEventListener('error', ()=>{
-        toast('❌ Браузер не может воспроизвести этот формат видео');
+      vid.addEventListener('error', (ev)=>{
+        const code = vid.error?.code;
+        // code 4 = MEDIA_ERR_SRC_NOT_SUPPORTED
+        if(code === 4){
+          // The old recordings are fMP4 — they simply cannot be played back
+          // Show a friendly download button
+          if(vid.parentNode === wrap) wrap.removeChild(vid);
+          vid = null;
+          wrap.innerHTML = '';
+          wrap.style.cssText = 'width:160px;height:160px;border-radius:50%;border:2px dashed rgba(229,57,53,.5);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;background:#0d0005;cursor:pointer;';
+          wrap.innerHTML = '<div style="font-size:24px">📥</div><div style="font-size:9px;color:var(--txt3);text-align:center;line-height:1.4;">Старый формат.<br>Нажми скачать</div>';
+          wrap.onclick = ()=>{ const a=document.createElement('a'); a.href=dataUrl; a.download='krugochek.mp4'; a.click(); };
+        }
       }, {once:true});
     }
   };
@@ -3815,10 +3834,15 @@ function getBestVideoMime(){
 }
 
 async function openVidNote(isGroup){
-  // Показать какой формат поддерживается
   const mime = getBestVideoMime();
-  console.log('BEST MIME:', mime || 'NONE SUPPORTED');
-  if(!mime){ toast('❌ Браузер не поддерживает запись видео'); return; }
+  console.log('BEST MIME for recording:', mime || 'NONE SUPPORTED');
+  if(!mime){ 
+    toast('❌ Браузер не поддерживает запись видео в webm формате');
+    return; 
+  }
+  if(mime.includes('mp4')){
+    toast('⚠️ Внимание: браузер записывает в mp4 — воспроизведение может не работать');
+  }
   vidIsGroup = isGroup;
   vidRecorded = false;
   vidChunks = [];
