@@ -2880,23 +2880,26 @@ const _mediaCache = new Map(); // msgId → {video?: blobUrl, audio?: blobUrl, d
 
 function _getOrCreateBlobUrl(msgId, dataUrl){
   if(_mediaCache.has(msgId)) return _mediaCache.get(msgId).url;
-  // На file:// протоколе createObjectURL может не работать — возвращаем dataUrl напрямую
-  if(location.protocol === 'file:'){
-    _mediaCache.set(msgId, {url: dataUrl});
-    return dataUrl;
-  }
   try{
-    const parts = dataUrl.split(',');
-    const mime = parts[0].match(/:(.*?);/)[1];
-    const bin = atob(parts[1]);
+    if(!dataUrl || !dataUrl.startsWith('data:')){ 
+      _mediaCache.set(msgId,{url:dataUrl}); return dataUrl; 
+    }
+    const comma = dataUrl.indexOf(',');
+    const header = dataUrl.slice(0, comma); // e.g. "data:video/mp4;base64"
+    const mime = header.split(':')[1].split(';')[0];
+    const b64 = dataUrl.slice(comma+1);
+    const bin = atob(b64);
     const buf = new Uint8Array(bin.length);
     for(let i=0;i<bin.length;i++) buf[i]=bin.charCodeAt(i);
-    const url = URL.createObjectURL(new Blob([buf],{type:mime}));
+    const blob = new Blob([buf], {type: mime});
+    console.log('BLOB created:', mime, blob.size, 'bytes');
+    const url = URL.createObjectURL(blob);
     _mediaCache.set(msgId, {url});
     return url;
-  }catch(e){
-    _mediaCache.set(msgId, {url: dataUrl});
-    return dataUrl;
+  }catch(e){ 
+    console.error('b64ToBlobUrl error:', e);
+    _mediaCache.set(msgId,{url:dataUrl}); 
+    return dataUrl; 
   }
 }
 
@@ -2906,33 +2909,54 @@ function b64ToBlobUrl(dataUrl){ return _getOrCreateBlobUrl('_tmp_'+Math.random()
 function _buildVidnoteEl(msgId, dataUrl){
   const wrap = document.createElement('div');
   wrap.className = 'msg-vidnote-wrap';
+
   const url = _getOrCreateBlobUrl(msgId, dataUrl);
+
   const vid = document.createElement('video');
   vid.className = 'msg-vidnote';
   vid.loop = true;
   vid.playsInline = true;
+  vid.muted = false;
+  vid.preload = 'metadata';
   vid.setAttribute('playsinline','');
   vid.setAttribute('webkit-playsinline','');
-  vid.setAttribute('preload','auto');
-  // Ставим src напрямую — работает и с blob: и с data:
+
+  // Ставим src и добавляем source тег для совместимости
   vid.src = url;
-  vid.onerror = ()=>{
-    // Если blob не сработал — попробуй dataUrl напрямую
-    if(vid.src !== dataUrl) vid.src = dataUrl;
+  vid.onerror = () => {
+    // Браузер не поддерживает формат — показываем кнопку скачать
+    wrap.innerHTML = '';
+    wrap.style.cssText = 'width:160px;height:160px;border-radius:50%;background:#1a1a2e;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;cursor:pointer;border:2px solid rgba(229,57,53,.4);';
+    wrap.innerHTML = `<div style="font-size:28px">🎥</div><div style="font-size:10px;color:#aaa;text-align:center;">Нажми для<br>скачивания</div>`;
+    wrap.onclick = () => {
+      const a = document.createElement('a');
+      a.href = dataUrl;
+      a.download = 'video.webm';
+      a.click();
+    };
   };
+
   const play = document.createElement('div');
   play.className = 'msg-vidnote-play';
-  play.textContent = '▶';
+  play.innerHTML = '▶';
+
   const tog = () => {
+    if(vid.readyState === 0){
+      vid.load();
+      vid.oncanplay = ()=>{ vid.play().catch(e=>toast('Ошибка: '+e.message)); vid.oncanplay=null; };
+      wrap.classList.add('msg-vidnote-playing');
+      return;
+    }
     if(vid.paused){
-      const p = vid.play();
-      if(p) p.then(()=>wrap.classList.add('msg-vidnote-playing'))
-             .catch(err=>{ toast('Ошибка: '+err.message.slice(0,50)); });
+      vid.play()
+        .then(()=>wrap.classList.add('msg-vidnote-playing'))
+        .catch(err=>toast('Ошибка: '+err.message));
     } else {
       vid.pause();
       wrap.classList.remove('msg-vidnote-playing');
     }
   };
+
   play.onclick = tog;
   vid.onclick = tog;
   vid.onended = ()=>wrap.classList.remove('msg-vidnote-playing');
@@ -3653,7 +3677,27 @@ async function markAllRead(){
 let vidStream = null, vidRecorder = null, vidChunks = [], vidTimer = null;
 let vidSeconds = 0, vidIsGroup = false, vidRecorded = false;
 
+// Определяем лучший поддерживаемый формат видео
+function getBestVideoMime(){
+  const types = [
+    'video/mp4;codecs=avc1',
+    'video/mp4',
+    'video/webm;codecs=vp9,opus',
+    'video/webm;codecs=vp8,opus',
+    'video/webm;codecs=h264',
+    'video/webm',
+  ];
+  for(const t of types){
+    if(MediaRecorder.isTypeSupported(t)) return t;
+  }
+  return '';
+}
+
 async function openVidNote(isGroup){
+  // Показать какой формат поддерживается
+  const mime = getBestVideoMime();
+  console.log('BEST MIME:', mime || 'NONE SUPPORTED');
+  if(!mime){ toast('❌ Браузер не поддерживает запись видео'); return; }
   vidIsGroup = isGroup;
   vidRecorded = false;
   vidChunks = [];
@@ -3664,7 +3708,10 @@ async function openVidNote(isGroup){
   $('vidnoteTimer').textContent = '0:00';
 
   try{
-    vidStream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:400},height:{ideal:400}}, audio:true});
+    vidStream = await navigator.mediaDevices.getUserMedia({
+      video:{facingMode:'user', width:{ideal:400}, height:{ideal:400}},
+      audio:true
+    });
     $('vidnotePreview').srcObject = vidStream;
     $('vidnoteOverlay').classList.add('on');
   }catch(e){
@@ -3684,12 +3731,14 @@ function startVidNoteRec(){
   if(!vidStream) return;
   vidChunks = []; vidSeconds = 0;
 
-  const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus') ? 'video/webm;codecs=vp8,opus'
-    : MediaRecorder.isTypeSupported('video/webm') ? 'video/webm'
-    : 'video/mp4';
+  const mime = getBestVideoMime();
+  try{
+    vidRecorder = mime ? new MediaRecorder(vidStream, {mimeType: mime}) : new MediaRecorder(vidStream);
+  }catch(e){
+    vidRecorder = new MediaRecorder(vidStream);
+  }
 
-  vidRecorder = new MediaRecorder(vidStream, {mimeType});
-  vidRecorder.ondataavailable = e => { if(e.data.size > 0) vidChunks.push(e.data); };
+  vidRecorder.ondataavailable = e => { if(e.data && e.data.size > 0) vidChunks.push(e.data); };
   vidRecorder.onstop = () => {
     vidRecorded = true;
     $('vidnoteRing').classList.remove('rec');
@@ -3697,22 +3746,20 @@ function startVidNoteRec(){
     $('vidnoteSendBtn').style.display = 'flex';
     clearInterval(vidTimer);
   };
-  vidRecorder.start(250);
+  vidRecorder.start(100);
   $('vidnoteRing').classList.add('rec');
   $('vidnoteRecBtn').textContent = '⏹';
 
   vidTimer = setInterval(()=>{
     vidSeconds++;
-    if(vidSeconds >= 60){ stopVidNoteRec(); return; } // max 60 sec
+    if(vidSeconds >= 60){ stopVidNoteRec(); return; }
     const m = Math.floor(vidSeconds/60), s = vidSeconds%60;
     $('vidnoteTimer').textContent = m+':'+(s<10?'0':'')+s;
   }, 1000);
 }
 
 function stopVidNoteRec(){
-  if(vidRecorder && vidRecorder.state === 'recording'){
-    vidRecorder.stop();
-  }
+  if(vidRecorder && vidRecorder.state === 'recording') vidRecorder.stop();
   clearInterval(vidTimer);
 }
 
@@ -3725,17 +3772,19 @@ function cancelVidNote(){
 
 async function sendVidNote(){
   if(!vidChunks.length){ toast('Нет записи'); return; }
-  const mimeType = vidRecorder?.mimeType || 'video/webm';
-  const blob = new Blob(vidChunks, {type: mimeType});
-  if(blob.size < 500){ toast('Запись слишком короткая'); return; }
+  const mimeUsed = vidRecorder?.mimeType || 'video/webm';
+  const blob = new Blob(vidChunks, {type: mimeUsed});
+  if(blob.size < 200){ toast('Запись слишком короткая'); return; }
 
-  // Stop camera
   if(vidStream){ vidStream.getTracks().forEach(t=>t.stop()); vidStream=null; }
   $('vidnoteOverlay').classList.remove('on');
   toast('⏳ Отправка кружочка...');
 
   const reader = new FileReader();
   reader.onload = async e => {
+    const dataUrl = e.target.result;
+    // Проверяем что dataUrl корректный
+    if(!dataUrl || !dataUrl.includes(',')){ toast('Ошибка: видео не записалось'); return; }
     try{
       if(vidIsGroup){
         if(!CG){ toast('Нет группы'); return; }
@@ -3747,7 +3796,7 @@ async function sendVidNote(){
             from_user: CU.id,
             sender_name: CU.username,
             text: '⭕ Кружочек',
-            image_data: 'VIDEO:' + e.target.result,
+            image_data: 'VIDEO:' + dataUrl,
             created_at: new Date().toISOString()
           })
         });
@@ -3762,7 +3811,7 @@ async function sendVidNote(){
             from_user: CU.id,
             to_user: CC.id,
             text: '⭕ Кружочек',
-            image_data: 'VIDEO:' + e.target.result,
+            image_data: 'VIDEO:' + dataUrl,
             created_at: new Date().toISOString(),
             read_by: []
           })
@@ -3771,7 +3820,7 @@ async function sendVidNote(){
         fetchMsgs(true);
       }
       toast('✓ Кружочек отправлен');
-    }catch(err){ toast('Ошибка: '+err.message.slice(0,60)); }
+    }catch(err){ toast('Ошибка: '+err.message.slice(0,80)); }
   };
   reader.readAsDataURL(blob);
   vidChunks = []; vidRecorded = false;
