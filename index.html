@@ -2988,124 +2988,88 @@ function _buildVidnoteEl(msgId, dataUrl){
   const wrap = document.createElement('div');
   wrap.className = 'msg-vidnote-wrap';
 
-  const play = document.createElement('div');
-  play.className = 'msg-vidnote-play';
-  play.innerHTML = '▶';
-  play.style.display = 'flex';
+  const playBtn = document.createElement('div');
+  playBtn.className = 'msg-vidnote-play';
+  playBtn.innerHTML = '▶';
+  wrap.appendChild(playBtn);
 
   let vid = null;
+  let blobUrl = null;
 
-  // Build blob URL once and cache it
-  function getBlobUrl(){
-    if(_mediaCache.has(msgId)) return _mediaCache.get(msgId).url;
+  function makeBlobUrl(){
+    if(blobUrl) return blobUrl;
+    if(_mediaCache.has(msgId)){ blobUrl = _mediaCache.get(msgId).url; return blobUrl; }
     try{
-      // Parse the data URL manually — most reliable across all browsers
       const comma = dataUrl.indexOf(',');
-      if(comma === -1) return dataUrl;
-      const header = dataUrl.slice(0, comma); // data:video/webm;base64
-      const mime = header.split(':')[1]?.split(';')[0] || 'video/webm';
+      const mime = dataUrl.slice(5, dataUrl.indexOf(';')) || 'video/webm';
       const b64 = dataUrl.slice(comma + 1);
-      
-      // Decode base64 in chunks to avoid stack overflow on large files
-      const chunkSize = 1024;
-      const chunks = [];
-      for(let i = 0; i < b64.length; i += chunkSize){
-        const chunk = b64.slice(i, i + chunkSize);
-        const bytes = atob(chunk);
-        const arr = new Uint8Array(bytes.length);
-        for(let j = 0; j < bytes.length; j++) arr[j] = bytes.charCodeAt(j);
-        chunks.push(arr);
-      }
-      const blob = new Blob(chunks, {type: mime});
-      const url = URL.createObjectURL(blob);
-      _mediaCache.set(msgId, {url});
-      console.log('Video blob created:', mime, blob.size, 'bytes →', url);
-      return url;
+      const binStr = atob(b64);
+      const buf = new Uint8Array(binStr.length);
+      for(let i = 0; i < binStr.length; i++) buf[i] = binStr.charCodeAt(i);
+      const blob = new Blob([buf], {type: mime});
+      blobUrl = URL.createObjectURL(blob);
+      _mediaCache.set(msgId, {url: blobUrl});
+      return blobUrl;
     }catch(e){
-      console.error('getBlobUrl error:', e);
-      return dataUrl; // fallback to data URL
+      console.error('makeBlobUrl:', e);
+      return null;
     }
   }
 
-  const tog = () => {
+  playBtn.onclick = function(e){
+    e.stopPropagation();
+
+    // Pause if playing
     if(vid && !vid.paused){
       vid.pause();
       wrap.classList.remove('msg-vidnote-playing');
-      play.style.display = 'flex';
+      playBtn.style.display = 'flex';
       return;
     }
 
+    // Create video element once
     if(!vid){
-      // Try blob URL first, then fall back to data URL directly
-      const blobUrl = getBlobUrl();
-      
+      const url = makeBlobUrl();
+      if(!url){ toast('Ошибка загрузки видео'); return; }
+
       vid = document.createElement('video');
       vid.className = 'msg-vidnote';
+      vid.src = url;
       vid.loop = true;
-      vid.playsInline = true;
-      vid.muted = true; // start muted — required for autoplay in most browsers
-      vid.setAttribute('playsinline','');
-      vid.setAttribute('webkit-playsinline','');
-      wrap.insertBefore(vid, play);
-      vid.onclick = tog;
-      vid.onended = ()=>{ wrap.classList.remove('msg-vidnote-playing'); play.style.display='flex'; };
-
-      // Try sources in order: blob URL → data URL directly
-      const src1 = document.createElement('source');
-      src1.src = blobUrl;
-      // detect mime from dataUrl header
-      const mimeMatch = dataUrl.match(/^data:([^;,]+)/);
-      const detectedMime = mimeMatch ? mimeMatch[1].split(';')[0].split(',')[0] : 'video/webm';
-      // strip codecs from mime for source type (codecs cause issues)
-      const baseMime = detectedMime.replace(/;.*$/,'');
-      src1.type = baseMime;
-      vid.appendChild(src1);
-      
-      vid.onerror = ()=>{
-        console.error('Video error code:', vid.error?.code, vid.error?.message, 'mime was:', baseMime);
-      };
-    }
-
-    const tryPlay = () => {
       vid.muted = true;
-      vid.play()
-        .then(()=>{ 
-          wrap.classList.add('msg-vidnote-playing'); 
-          play.style.display='none';
-          // After playing, try to unmute
-          vid.muted = false;
-        })
-        .catch(e=>{ 
-          console.error('play() failed:', e.message);
-          toast('❌ ' + (e.message||'Ошибка воспроизведения'));
-        });
-    };
-
-    if(vid.readyState >= 2){
-      tryPlay();
-    } else {
-      vid.addEventListener('canplay', tryPlay, {once:true});
-      vid.addEventListener('error', (ev)=>{
-        const code = vid.error?.code;
-        // code 4 = MEDIA_ERR_SRC_NOT_SUPPORTED
-        if(code === 4){
-          // The old recordings are fMP4 — they simply cannot be played back
-          // Show a friendly download button
-          if(vid.parentNode === wrap) wrap.removeChild(vid);
-          vid = null;
-          wrap.innerHTML = '';
-          wrap.style.cssText = 'width:160px;height:160px;border-radius:50%;border:2px dashed rgba(229,57,53,.5);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;background:#0d0005;cursor:pointer;';
-          wrap.innerHTML = '<div style="font-size:24px">📥</div><div style="font-size:9px;color:var(--txt3);text-align:center;line-height:1.4;">Старый формат.<br>Нажми скачать</div>';
-          wrap.onclick = ()=>{ const a=document.createElement('a'); a.href=dataUrl; a.download='krugochek.mp4'; a.click(); };
-        }
-      }, {once:true});
+      vid.playsInline = true;
+      vid.setAttribute('playsinline','');
+      wrap.insertBefore(vid, playBtn);
+      vid.onclick = playBtn.onclick;
+      vid.onended = ()=>{ wrap.classList.remove('msg-vidnote-playing'); playBtn.style.display='flex'; };
     }
+
+    // Play
+    playBtn.innerHTML = '⏳';
+    vid.play()
+      .then(()=>{
+        playBtn.style.display = 'none';
+        playBtn.innerHTML = '▶';
+        wrap.classList.add('msg-vidnote-playing');
+        try{ vid.muted = false; }catch(e){}
+      })
+      .catch(err=>{
+        playBtn.innerHTML = '▶';
+        console.error('vid.play() error:', err.name, err.message, '| readyState:', vid.readyState, '| error:', vid.error);
+        if(vid.error && vid.error.code === 4){
+          // Format not supported — show download
+          wrap.style.cssText = 'width:160px;height:160px;border-radius:50%;border:2px dashed rgba(229,57,53,.4);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;cursor:pointer;background:#100005;';
+          wrap.innerHTML = '<div style="font-size:28px">📥</div><div style="font-size:10px;color:#888;text-align:center;">Нажми для<br>скачивания</div>';
+          wrap.onclick = ()=>{ const a=document.createElement('a'); a.href=dataUrl; a.download='video.mp4'; a.click(); };
+        } else {
+          toast('Ошибка: ' + err.message);
+        }
+      });
   };
 
-  play.onclick = (e) => { e.stopPropagation(); tog(); };
-  wrap.appendChild(play);
   return wrap;
 }
+
 
 function _buildVoiceEl(msgId, dataUrl, durTxt){
   const blobUrl = _getOrCreateBlobUrl(msgId, dataUrl);
