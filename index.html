@@ -2995,22 +2995,39 @@ function _buildVidnoteEl(msgId, dataUrl){
 
   let vid = null;
 
-  // Конвертируем base64 → Blob → ObjectURL через fetch (самый надёжный способ для больших файлов)
-  async function getObjectUrl(){
+  // Build blob URL once and cache it
+  function getBlobUrl(){
     if(_mediaCache.has(msgId)) return _mediaCache.get(msgId).url;
     try{
-      const resp = await fetch(dataUrl);
-      const blob = await resp.blob();
+      // Parse the data URL manually — most reliable across all browsers
+      const comma = dataUrl.indexOf(',');
+      if(comma === -1) return dataUrl;
+      const header = dataUrl.slice(0, comma); // data:video/webm;base64
+      const mime = header.split(':')[1]?.split(';')[0] || 'video/webm';
+      const b64 = dataUrl.slice(comma + 1);
+      
+      // Decode base64 in chunks to avoid stack overflow on large files
+      const chunkSize = 1024;
+      const chunks = [];
+      for(let i = 0; i < b64.length; i += chunkSize){
+        const chunk = b64.slice(i, i + chunkSize);
+        const bytes = atob(chunk);
+        const arr = new Uint8Array(bytes.length);
+        for(let j = 0; j < bytes.length; j++) arr[j] = bytes.charCodeAt(j);
+        chunks.push(arr);
+      }
+      const blob = new Blob(chunks, {type: mime});
       const url = URL.createObjectURL(blob);
       _mediaCache.set(msgId, {url});
+      console.log('Video blob created:', mime, blob.size, 'bytes →', url);
       return url;
     }catch(e){
-      console.error('getObjectUrl error:', e);
-      return null;
+      console.error('getBlobUrl error:', e);
+      return dataUrl; // fallback to data URL
     }
   }
 
-  const tog = async () => {
+  const tog = () => {
     if(vid && !vid.paused){
       vid.pause();
       wrap.classList.remove('msg-vidnote-playing');
@@ -3018,13 +3035,8 @@ function _buildVidnoteEl(msgId, dataUrl){
       return;
     }
 
-    // Строим video элемент один раз
     if(!vid){
-      play.innerHTML = '⏳';
-      const url = await getObjectUrl();
-      play.innerHTML = '▶';
-      if(!url){ toast('❌ Не удалось загрузить видео'); return; }
-
+      const blobUrl = getBlobUrl();
       vid = document.createElement('video');
       vid.className = 'msg-vidnote';
       vid.loop = true;
@@ -3032,27 +3044,42 @@ function _buildVidnoteEl(msgId, dataUrl){
       vid.muted = false;
       vid.setAttribute('playsinline','');
       vid.setAttribute('webkit-playsinline','');
-      vid.src = url;
+      vid.src = blobUrl;
       wrap.insertBefore(vid, play);
       vid.onclick = tog;
       vid.onended = ()=>{ wrap.classList.remove('msg-vidnote-playing'); play.style.display='flex'; };
+      vid.onerror = ()=>{
+        const code = vid.error?.code;
+        console.error('Video error code:', code, vid.error?.message);
+        // MEDIA_ERR_SRC_NOT_SUPPORTED (4) = format not playable — show download button
+        if(code === 4 || code === 3){
+          wrap.innerHTML = '';
+          wrap.style.cssText += ';display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;background:#1a0505;cursor:pointer;';
+          wrap.innerHTML = '<div style="font-size:26px">📥</div><div style="font-size:9px;color:#aaa;text-align:center;padding:0 10px;">Формат не<br>поддерживается.<br>Нажми чтобы<br>скачать</div>';
+          wrap.onclick = ()=>{ const a=document.createElement('a'); a.href=dataUrl; a.download='video.webm'; a.click(); };
+        }
+      };
     }
 
-    // Воспроизводим
-    try{
-      await vid.play();
-      wrap.classList.add('msg-vidnote-playing');
-      play.style.display = 'none';
-    }catch(e){
-      // Если заблокировано — пробуем без звука
-      try{
-        vid.muted = true;
-        await vid.play();
-        wrap.classList.add('msg-vidnote-playing');
-        play.style.display = 'none';
-      }catch(e2){
-        toast('❌ Ошибка воспроизведения: ' + (e2.message||'неизвестная'));
-      }
+    const tryPlay = () => {
+      vid.muted = false;
+      vid.play()
+        .then(()=>{ wrap.classList.add('msg-vidnote-playing'); play.style.display='none'; })
+        .catch(()=>{
+          vid.muted = true;
+          vid.play()
+            .then(()=>{ wrap.classList.add('msg-vidnote-playing'); play.style.display='none'; })
+            .catch(e=>{ toast('❌ ' + (e.message||'Ошибка воспроизведения')); });
+        });
+    };
+
+    if(vid.readyState >= 2){
+      tryPlay();
+    } else {
+      vid.addEventListener('canplay', tryPlay, {once:true});
+      vid.addEventListener('error', ()=>{
+        toast('❌ Браузер не может воспроизвести этот формат видео');
+      }, {once:true});
     }
   };
 
@@ -3772,18 +3799,19 @@ let vidSeconds = 0, vidIsGroup = false, vidRecorded = false;
 
 // Определяем лучший поддерживаемый формат видео
 function getBestVideoMime(){
+  // NEVER use mp4 — MediaRecorder produces fragmented mp4 (fMP4) which browsers can't play back
+  // Always use webm which is universally playable
   const types = [
-    'video/mp4;codecs=avc1',
-    'video/mp4',
-    'video/webm;codecs=vp9,opus',
     'video/webm;codecs=vp8,opus',
-    'video/webm;codecs=h264',
+    'video/webm;codecs=vp9,opus',
+    'video/webm;codecs=h264,opus',
     'video/webm',
   ];
   for(const t of types){
     if(MediaRecorder.isTypeSupported(t)) return t;
   }
-  return '';
+  // Edge fallback — if no webm supported, try without codec spec
+  return MediaRecorder.isTypeSupported('video/webm') ? 'video/webm' : '';
 }
 
 async function openVidNote(isGroup){
