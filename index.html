@@ -2993,60 +2993,24 @@ function _buildVidnoteEl(msgId, dataUrl){
   play.innerHTML = '▶';
   play.style.display = 'flex';
 
-  // Parse mime type from data URL
-  let mimeType = 'video/webm';
-  if(dataUrl && dataUrl.startsWith('data:')){
-    const m = dataUrl.match(/^data:([^;]+);/);
-    if(m) mimeType = m[1];
-  }
-
-  // Convert base64 → Blob → Object URL (most reliable method for video)
-  function makeObjectUrl(b64DataUrl){
-    try{
-      const comma = b64DataUrl.indexOf(',');
-      if(comma === -1) return null;
-      const b64 = b64DataUrl.slice(comma + 1);
-      // Use fetch decode trick — more reliable than manual atob for large files
-      const byteStr = atob(b64);
-      const ab = new ArrayBuffer(byteStr.length);
-      const ia = new Uint8Array(ab);
-      for(let i = 0; i < byteStr.length; i++) ia[i] = byteStr.charCodeAt(i);
-      const blob = new Blob([ab], {type: mimeType});
-      return URL.createObjectURL(blob);
-    }catch(e){ console.error('makeObjectUrl failed:', e); return null; }
-  }
-
-  let objectUrl = null;
   let vid = null;
-  let loaded = false;
 
-  const buildVideo = () => {
-    if(vid) return; // already built
-
-    // Build object URL lazily on first play
-    if(!objectUrl){
-      objectUrl = makeObjectUrl(dataUrl);
-      if(!objectUrl){
-        toast('❌ Ошибка: не удалось декодировать видео');
-        return;
-      }
+  // Конвертируем base64 → Blob → ObjectURL через fetch (самый надёжный способ для больших файлов)
+  async function getObjectUrl(){
+    if(_mediaCache.has(msgId)) return _mediaCache.get(msgId).url;
+    try{
+      const resp = await fetch(dataUrl);
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      _mediaCache.set(msgId, {url});
+      return url;
+    }catch(e){
+      console.error('getObjectUrl error:', e);
+      return null;
     }
+  }
 
-    vid = document.createElement('video');
-    vid.className = 'msg-vidnote';
-    vid.loop = true;
-    vid.playsInline = true;
-    vid.muted = false;
-    vid.setAttribute('playsinline','');
-    vid.setAttribute('webkit-playsinline','');
-    vid.src = objectUrl;
-    wrap.insertBefore(vid, play);
-
-    vid.onclick = tog;
-    vid.onended = ()=>{ wrap.classList.remove('msg-vidnote-playing'); play.style.display='flex'; };
-  };
-
-  const tog = () => {
+  const tog = async () => {
     if(vid && !vid.paused){
       vid.pause();
       wrap.classList.remove('msg-vidnote-playing');
@@ -3054,36 +3018,41 @@ function _buildVidnoteEl(msgId, dataUrl){
       return;
     }
 
-    buildVideo();
-    if(!vid) return;
+    // Строим video элемент один раз
+    if(!vid){
+      play.innerHTML = '⏳';
+      const url = await getObjectUrl();
+      play.innerHTML = '▶';
+      if(!url){ toast('❌ Не удалось загрузить видео'); return; }
 
-    const tryPlay = () => {
+      vid = document.createElement('video');
+      vid.className = 'msg-vidnote';
+      vid.loop = true;
+      vid.playsInline = true;
       vid.muted = false;
-      vid.play()
-        .then(()=>{
-          wrap.classList.add('msg-vidnote-playing');
-          play.style.display = 'none';
-        })
-        .catch(()=>{
-          vid.muted = true;
-          vid.play()
-            .then(()=>{
-              wrap.classList.add('msg-vidnote-playing');
-              play.style.display = 'none';
-            })
-            .catch(e => toast('Ошибка воспроизведения: ' + e.message));
-        });
-    };
+      vid.setAttribute('playsinline','');
+      vid.setAttribute('webkit-playsinline','');
+      vid.src = url;
+      wrap.insertBefore(vid, play);
+      vid.onclick = tog;
+      vid.onended = ()=>{ wrap.classList.remove('msg-vidnote-playing'); play.style.display='flex'; };
+    }
 
-    if(vid.readyState >= 3){
-      tryPlay();
-    } else {
-      vid.addEventListener('canplay', tryPlay, {once: true});
-      vid.addEventListener('error', ()=>{
-        console.error('vid error:', vid.error?.code, vid.error?.message, 'mime:', mimeType);
-        toast('❌ Формат не поддерживается браузером (' + mimeType + ')');
-      }, {once: true});
-      vid.load();
+    // Воспроизводим
+    try{
+      await vid.play();
+      wrap.classList.add('msg-vidnote-playing');
+      play.style.display = 'none';
+    }catch(e){
+      // Если заблокировано — пробуем без звука
+      try{
+        vid.muted = true;
+        await vid.play();
+        wrap.classList.add('msg-vidnote-playing');
+        play.style.display = 'none';
+      }catch(e2){
+        toast('❌ Ошибка воспроизведения: ' + (e2.message||'неизвестная'));
+      }
     }
   };
 
@@ -3909,10 +3878,7 @@ async function sendVidNote(){
     let dataUrl = e.target.result;
     // Проверяем что dataUrl корректный
     if(!dataUrl || !dataUrl.includes(',')){ toast('Ошибка: видео не записалось'); return; }
-    // Normalize mime type — ensure it says video/webm for compatibility
-    if(dataUrl.startsWith('data:video/') && !dataUrl.startsWith('data:video/webm') && !dataUrl.startsWith('data:video/mp4')){
-      dataUrl = 'data:video/webm;base64,' + dataUrl.split(',')[1];
-    }
+
     try{
       if(vidIsGroup){
         if(!CG){ toast('Нет группы'); return; }
