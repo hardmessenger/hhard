@@ -712,9 +712,10 @@ body.bubble-violet .msg.me .msg-bubble{background:linear-gradient(135deg,#4a148c
 .msg-vidnote{width:160px;height:160px;border-radius:50%;object-fit:cover;cursor:pointer;display:block;}
 .msg-vidnote-wrap{position:relative;width:160px;height:160px;border-radius:50%;overflow:hidden;flex-shrink:0;box-shadow:0 4px 20px rgba(0,0,0,.5);}
 .msg-bubble.vidnote-bubble{background:transparent!important;border:none!important;padding:0!important;box-shadow:none!important;}
-.msg-vidnote-play{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.35);border-radius:50%;cursor:pointer;font-size:32px;color:#fff;opacity:1;transition:opacity .2s;}
-.msg-vidnote-playing .msg-vidnote-play{opacity:0;}
-.msg-vidnote-wrap:hover .msg-vidnote-play{opacity:1;}
+.msg-vidnote-play{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.4);border-radius:50%;cursor:pointer;font-size:36px;color:#fff;transition:background .15s;z-index:2;}
+.msg-vidnote-play:hover{background:rgba(0,0,0,.55);}
+.msg-vidnote-wrap{border:3px solid rgba(229,57,53,.5);}
+.msg-vidnote-playing .msg-vidnote-wrap{border-color:var(--red);}
 
 </style>
 </head>
@@ -1331,7 +1332,19 @@ const DB={
   async delete(t,q){const r=await fetch(`${SURL}/rest/v1/${t}?${q}`,{method:'DELETE',headers:H});if(!r.ok)throw new Error(await r.text());return true;}
 };
 
-function startPolling(){stopPolling();pollingInterval=setInterval(()=>{if(CC)fetchMsgs(false);fetchUsers(false);if(CC)checkTyping();},2500);}
+let _usersPollingInterval=null;
+function startPolling(){
+  stopPolling();
+  // Messages poll every 3s when chat open
+  pollingInterval=setInterval(()=>{if(CC)fetchMsgs(false);if(CC)checkTyping();},3000);
+  // Users/contacts poll every 8s (much less critical, reduces 500 errors)
+  if(_usersPollingInterval) clearInterval(_usersPollingInterval);
+  _usersPollingInterval=setInterval(()=>{fetchUsers(false);},8000);
+}
+function stopPolling(){
+  if(pollingInterval){clearInterval(pollingInterval);pollingInterval=null;}
+  if(_usersPollingInterval){clearInterval(_usersPollingInterval);_usersPollingInterval=null;}
+}
 
 // ─── TYPING INDICATOR ───
 let typingTimeout=null;
@@ -1625,7 +1638,13 @@ async function fetchUsers(){
 
 async function buildConversations(){
   let data=[];
-  try{data=await DB.select('messages',`or=(from_user.eq.${CU.id},to_user.eq.${CU.id})&order=created_at.desc&limit=300`);}catch(e){}
+  try{
+    const [s2,r2]=await Promise.all([
+      DB.select('messages',`from_user=eq.${CU.id}&order=created_at.desc&limit=60`),
+      DB.select('messages',`to_user=eq.${CU.id}&order=created_at.desc&limit=60`)
+    ]);
+    data=[...(s2||[]),...(r2||[])].sort((a,b)=>new Date(b.created_at)-new Date(a.created_at));
+  }catch(e){console.error('buildConv',e);}
   const conv={};
   data.forEach(m=>{
     const otherId=m.from_user===CU.id?m.to_user:m.from_user;
@@ -1640,11 +1659,54 @@ function renderConversations(){
   let list=Object.values(conversations);
   if(currentFolder==='online')list=list.filter(c=>c.user.online);
   if(currentFolder==='unread')list=list.filter(c=>c.unreadCount>0);
-  if(!list.length){el.innerHTML=`<div class="no-ci">${currentFolder==='online'?'Никого нет онлайн':currentFolder==='unread'?'Все прочитано ✓':'Нет переписок<br><br>Нажми ✏️ чтобы написать'}</div>`;return;}
+  if(!list.length){
+    el.innerHTML=`<div class="no-ci">${currentFolder==='online'?'Никого нет онлайн':currentFolder==='unread'?'Все прочитано ✓':'Нет переписок<br><br>Нажми ✏️ чтобы написать'}</div>`;
+    return;
+  }
   list.sort((a,b)=>new Date(b.lastMsg.created_at)-new Date(a.lastMsg.created_at));
+  
+  // Smart update: only rebuild if order/count changed, otherwise update status in-place
+  const existingIds = [...el.querySelectorAll('.ci[data-uid]')].map(x=>x.dataset.uid);
+  const newIds = list.map(c=>c.user.id);
+  const orderChanged = existingIds.join(',') !== newIds.join(',');
+  
+  if(!orderChanged && existingIds.length === newIds.length){
+    // Just update online dots and badges in place - no flicker
+    list.forEach(({user:u, lastMsg, unreadCount})=>{
+      const row = el.querySelector(`.ci[data-uid="${u.id}"]`);
+      if(!row) return;
+      const dot = row.querySelector('.ci-dot');
+      if(u.online && !dot){
+        const avaWrap = row.querySelector('.ci-ava');
+        if(avaWrap){ const nd=document.createElement('div'); nd.className='ci-dot'; avaWrap.appendChild(nd); }
+      } else if(!u.online && dot){ dot.remove(); }
+      const statusEl = row.querySelector('.ci-name');
+      if(statusEl){
+        // Update status badge text if changed
+        const newStatusHtml = getBadgeHTML(u.id)+getStatusHTML(u);
+        const curBadge = row.querySelector('.st-badge');
+        if(getStatusHTML(u) !== (curBadge?.outerHTML||'')){
+          // rebuild only name part
+          const badge = row.querySelector('.ci-name');
+          if(badge) badge.innerHTML = eh(u.username)+getBadgeHTML(u.id)+getStatusHTML(u);
+        }
+      }
+      const badge = row.querySelector('.ci-badge');
+      if(unreadCount > 0){
+        if(badge) badge.textContent=unreadCount;
+        else{
+          const row2=row.querySelector('.ci-row2');
+          if(row2){ const nb=document.createElement('div'); nb.className='ci-badge'; nb.textContent=unreadCount; row2.appendChild(nb); }
+        }
+      } else if(badge){ badge.remove(); }
+    });
+    return;
+  }
+  
+  // Full rebuild only when order changes
   el.innerHTML='';
   list.forEach(({user:u,lastMsg,unreadCount})=>{
-    const d=document.createElement('div');d.className='ci';d.onclick=()=>openChat(u);
+    const d=document.createElement('div');d.className='ci';d.dataset.uid=u.id;d.onclick=()=>openChat(u);
     const _lt=lastMsg.text||'';
     const _ld=lastMsg.image_data||'';
     const preview=_ld.startsWith('VOICE:')?'🎤 Голосовое':_ld.startsWith('VIDEO:')?'⭕ Кружочек':(_ld&&!_ld.startsWith('VOICE:')&&!_ld.startsWith('VIDEO:'))?'📷 Фото':_lt.startsWith('__CALL__')?'📞 Звонок':_lt;
@@ -2059,7 +2121,14 @@ function loadMsgs(){fetchMsgs(true);setTimeout(initUnreadJump,500);}
 
 async function fetchMsgs(scroll=true){
   if(!CC)return;
-  let data=[];try{data=await DB.select('messages',`or=(and(from_user.eq.${CU.id},to_user.eq.${CC.id}),and(from_user.eq.${CC.id},to_user.eq.${CU.id}))&order=created_at.asc`);}catch(e){}
+  let data=[];
+  try{
+    const [sent,recv]=await Promise.all([
+      DB.select('messages',`from_user=eq.${CU.id}&to_user=eq.${CC.id}&order=created_at.asc`),
+      DB.select('messages',`from_user=eq.${CC.id}&to_user=eq.${CU.id}&order=created_at.asc`)
+    ]);
+    data=[...(sent||[]),...(recv||[])].sort((a,b)=>new Date(a.created_at)-new Date(b.created_at));
+  }catch(e){console.error('fetchMsgs',e);}
   const newMsgs=(data||[]).filter(m=>!m.text||!m.text.startsWith('__CALL__'));
   const hasChanges=JSON.stringify(newMsgs.map(m=>({id:m.id,text:m.text,reactions:m.reactions,edited:m.edited,read_by:m.read_by,pinned:m.pinned})))!==JSON.stringify(msgs.map(m=>({id:m.id,text:m.text,reactions:m.reactions,edited:m.edited,read_by:m.read_by,pinned:m.pinned})));
   msgs=newMsgs;
@@ -2276,7 +2345,10 @@ async function addReaction(msgId,emoji){
 
 // ─── PIN ───
 async function pinMessage(msgId){
-  await DB.update('messages',{pinned:false},`or=(and(from_user.eq.${CU.id},to_user.eq.${CC.id}),and(from_user.eq.${CC.id},to_user.eq.${CU.id}))`).catch(()=>{});
+  await Promise.all([
+    DB.update('messages',{pinned:false},`from_user=eq.${CU.id}&to_user=eq.${CC.id}`).catch(()=>{}),
+    DB.update('messages',{pinned:false},`from_user=eq.${CC.id}&to_user=eq.${CU.id}`).catch(()=>{})
+  ]);
   await DB.update('messages',{pinned:true},`id=eq.${msgId}`);toast('📌 Закреплено');
 }
 async function unpinMsg(){if(pinnedMsgId)await DB.update('messages',{pinned:false},`id=eq.${pinnedMsgId}`);pinnedMsgId=null;$('pinnedBar').classList.remove('on');}
@@ -2328,7 +2400,10 @@ function openChatMenu(){
   `;
   openBs();
 }
-async function clearHistory(){if(!confirm('Удалить всю историю чата?'))return;await DB.delete('messages',`or=(and(from_user.eq.${CU.id},to_user.eq.${CC.id}),and(from_user.eq.${CC.id},to_user.eq.${CU.id}))`);toast('✓ История очищена');}
+async function clearHistory(){if(!confirm('Удалить всю историю чата?'))return;await Promise.all([
+    DB.delete('messages',`from_user=eq.${CU.id}&to_user=eq.${CC.id}`),
+    DB.delete('messages',`from_user=eq.${CC.id}&to_user=eq.${CU.id}`)
+  ]);toast('✓ История очищена');}
 
 // ─── EMOJI ───
 function setupEmoji(){
@@ -2734,7 +2809,10 @@ async function confirmDeleteAccount(){
   if(!confirm2) return;
   try{
     // Удаляем все сообщения
-    await DB.delete('messages',`or=(from_user.eq.${CU.id},to_user.eq.${CU.id})`);
+    await Promise.all([
+    DB.delete('messages',`from_user=eq.${CU.id}`),
+    DB.delete('messages',`to_user=eq.${CU.id}`)
+  ]);
     // Удаляем пользователя
     await DB.delete('users',`id=eq.${CU.id}`);
     localStorage.clear();
@@ -2910,57 +2988,106 @@ function _buildVidnoteEl(msgId, dataUrl){
   const wrap = document.createElement('div');
   wrap.className = 'msg-vidnote-wrap';
 
-  const url = _getOrCreateBlobUrl(msgId, dataUrl);
-
-  const vid = document.createElement('video');
-  vid.className = 'msg-vidnote';
-  vid.loop = true;
-  vid.playsInline = true;
-  vid.muted = false;
-  vid.preload = 'metadata';
-  vid.setAttribute('playsinline','');
-  vid.setAttribute('webkit-playsinline','');
-
-  // Ставим src и добавляем source тег для совместимости
-  vid.src = url;
-  vid.onerror = () => {
-    // Браузер не поддерживает формат — показываем кнопку скачать
-    wrap.innerHTML = '';
-    wrap.style.cssText = 'width:160px;height:160px;border-radius:50%;background:#1a1a2e;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;cursor:pointer;border:2px solid rgba(229,57,53,.4);';
-    wrap.innerHTML = `<div style="font-size:28px">🎥</div><div style="font-size:10px;color:#aaa;text-align:center;">Нажми для<br>скачивания</div>`;
-    wrap.onclick = () => {
-      const a = document.createElement('a');
-      a.href = dataUrl;
-      a.download = 'video.webm';
-      a.click();
-    };
-  };
-
   const play = document.createElement('div');
   play.className = 'msg-vidnote-play';
   play.innerHTML = '▶';
+  play.style.display = 'flex';
+
+  // Parse mime type from data URL
+  let mimeType = 'video/webm';
+  if(dataUrl && dataUrl.startsWith('data:')){
+    const m = dataUrl.match(/^data:([^;]+);/);
+    if(m) mimeType = m[1];
+  }
+
+  // Convert base64 → Blob → Object URL (most reliable method for video)
+  function makeObjectUrl(b64DataUrl){
+    try{
+      const comma = b64DataUrl.indexOf(',');
+      if(comma === -1) return null;
+      const b64 = b64DataUrl.slice(comma + 1);
+      // Use fetch decode trick — more reliable than manual atob for large files
+      const byteStr = atob(b64);
+      const ab = new ArrayBuffer(byteStr.length);
+      const ia = new Uint8Array(ab);
+      for(let i = 0; i < byteStr.length; i++) ia[i] = byteStr.charCodeAt(i);
+      const blob = new Blob([ab], {type: mimeType});
+      return URL.createObjectURL(blob);
+    }catch(e){ console.error('makeObjectUrl failed:', e); return null; }
+  }
+
+  let objectUrl = null;
+  let vid = null;
+  let loaded = false;
+
+  const buildVideo = () => {
+    if(vid) return; // already built
+
+    // Build object URL lazily on first play
+    if(!objectUrl){
+      objectUrl = makeObjectUrl(dataUrl);
+      if(!objectUrl){
+        toast('❌ Ошибка: не удалось декодировать видео');
+        return;
+      }
+    }
+
+    vid = document.createElement('video');
+    vid.className = 'msg-vidnote';
+    vid.loop = true;
+    vid.playsInline = true;
+    vid.muted = false;
+    vid.setAttribute('playsinline','');
+    vid.setAttribute('webkit-playsinline','');
+    vid.src = objectUrl;
+    wrap.insertBefore(vid, play);
+
+    vid.onclick = tog;
+    vid.onended = ()=>{ wrap.classList.remove('msg-vidnote-playing'); play.style.display='flex'; };
+  };
 
   const tog = () => {
-    if(vid.readyState === 0){
-      vid.load();
-      vid.oncanplay = ()=>{ vid.play().catch(e=>toast('Ошибка: '+e.message)); vid.oncanplay=null; };
-      wrap.classList.add('msg-vidnote-playing');
-      return;
-    }
-    if(vid.paused){
-      vid.play()
-        .then(()=>wrap.classList.add('msg-vidnote-playing'))
-        .catch(err=>toast('Ошибка: '+err.message));
-    } else {
+    if(vid && !vid.paused){
       vid.pause();
       wrap.classList.remove('msg-vidnote-playing');
+      play.style.display = 'flex';
+      return;
+    }
+
+    buildVideo();
+    if(!vid) return;
+
+    const tryPlay = () => {
+      vid.muted = false;
+      vid.play()
+        .then(()=>{
+          wrap.classList.add('msg-vidnote-playing');
+          play.style.display = 'none';
+        })
+        .catch(()=>{
+          vid.muted = true;
+          vid.play()
+            .then(()=>{
+              wrap.classList.add('msg-vidnote-playing');
+              play.style.display = 'none';
+            })
+            .catch(e => toast('Ошибка воспроизведения: ' + e.message));
+        });
+    };
+
+    if(vid.readyState >= 3){
+      tryPlay();
+    } else {
+      vid.addEventListener('canplay', tryPlay, {once: true});
+      vid.addEventListener('error', ()=>{
+        console.error('vid error:', vid.error?.code, vid.error?.message, 'mime:', mimeType);
+        toast('❌ Формат не поддерживается браузером (' + mimeType + ')');
+      }, {once: true});
+      vid.load();
     }
   };
 
-  play.onclick = tog;
-  vid.onclick = tog;
-  vid.onended = ()=>wrap.classList.remove('msg-vidnote-playing');
-  wrap.appendChild(vid);
+  play.onclick = (e) => { e.stopPropagation(); tog(); };
   wrap.appendChild(play);
   return wrap;
 }
@@ -3165,7 +3292,7 @@ async function sendGroupFiles(input){
 // ─── GROUP POLLING ───
 function startGroupPolling(){
   clearInterval(grpPollInterval);
-  grpPollInterval = setInterval(()=>{ if(CG) fetchGroupMsgs(false); }, 2500);
+  grpPollInterval = setInterval(()=>{ if(CG) fetchGroupMsgs(false); }, 3500);
 }
 function stopGroupPolling(){ clearInterval(grpPollInterval); grpPollInterval=null; }
 
@@ -3633,16 +3760,13 @@ async function loadSharedMedia(){
   if(!grid||!section) return;
   grid.innerHTML='';
   try{
-    const params=new URLSearchParams({
-      select:'image_data,created_at',
-      or:`and(from_user.eq.${CU.id},to_user.eq.${CC.id}),and(from_user.eq.${CC.id},to_user.eq.${CU.id})`,
-      'image_data':'not.is.null',
-      order:'created_at.desc',
-      limit:'9'
-    });
-    const r=await fetchWithTimeout(`${SURL}/rest/v1/messages?${params}`,{headers:H},4000);
-    if(!r.ok) return;
-    const photos=await r.json();
+    const [p1,p2]=await Promise.all([
+      fetchWithTimeout(`${SURL}/rest/v1/messages?from_user=eq.${CU.id}&to_user=eq.${CC.id}&select=image_data,created_at&image_data=not.is.null&order=created_at.desc&limit=5`,{headers:H},4000),
+      fetchWithTimeout(`${SURL}/rest/v1/messages?from_user=eq.${CC.id}&to_user=eq.${CU.id}&select=image_data,created_at&image_data=not.is.null&order=created_at.desc&limit=5`,{headers:H},4000)
+    ]);
+    const a1=p1.ok?await p1.json():[];
+    const a2=p2.ok?await p2.json():[];
+    const photos=[...a1,...a2].sort((a,b)=>new Date(b.created_at)-new Date(a.created_at)).slice(0,9);
     if(!photos||!photos.length){ section.style.display='none'; return; }
     section.style.display='block';
     photos.forEach(m=>{
@@ -3782,9 +3906,13 @@ async function sendVidNote(){
 
   const reader = new FileReader();
   reader.onload = async e => {
-    const dataUrl = e.target.result;
+    let dataUrl = e.target.result;
     // Проверяем что dataUrl корректный
     if(!dataUrl || !dataUrl.includes(',')){ toast('Ошибка: видео не записалось'); return; }
+    // Normalize mime type — ensure it says video/webm for compatibility
+    if(dataUrl.startsWith('data:video/') && !dataUrl.startsWith('data:video/webm') && !dataUrl.startsWith('data:video/mp4')){
+      dataUrl = 'data:video/webm;base64,' + dataUrl.split(',')[1];
+    }
     try{
       if(vidIsGroup){
         if(!CG){ toast('Нет группы'); return; }
