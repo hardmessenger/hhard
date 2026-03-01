@@ -1332,6 +1332,19 @@ const DB={
   async delete(t,q){const r=await fetch(`${SURL}/rest/v1/${t}?${q}`,{method:'DELETE',headers:H});if(!r.ok)throw new Error(await r.text());return true;}
 };
 
+// Создаём bucket для видео если не существует
+async function initStorageBucket(){
+  try{
+    const r = await fetch(`${SURL}/storage/v1/bucket`, {
+      method:'POST',
+      headers:{'apikey':SKEY,'Authorization':'Bearer '+SKEY,'Content-Type':'application/json'},
+      body: JSON.stringify({id:'videos',name:'videos',public:true})
+    });
+    // 200 = created, 409 = already exists — both are fine
+    console.log('Storage bucket init:', r.status);
+  }catch(e){ console.warn('bucket init:', e.message); }
+}
+
 let _usersPollingInterval=null;
 function startPolling(){
   stopPolling();
@@ -1453,6 +1466,7 @@ async function init(){
             clearTimeout(HARD_TIMEOUT);
             CU = found;
             DB.update('users',{online:true,last_seen:new Date().toISOString()},`id=eq.${CU.id}`).catch(()=>{});
+            initStorageBucket().catch(()=>{});
             hideLoadScreen();
             setTimeout(()=>{
               $('app').classList.add('on');
@@ -2170,7 +2184,10 @@ function renderMsgs(list,scrollBottom=false){
     const bubble=document.createElement('div');bubble.className='msg-bubble';
     if(m.forwarded_from){const fw=document.createElement('div');fw.style.cssText='font-size:10px;color:var(--txt3);margin-bottom:4px;font-family:var(--mono)';fw.textContent='↪ Переслано';bubble.appendChild(fw);}
     if(m.reply_text){const q=document.createElement('div');q.className='msg-rq';q.innerHTML=`<div class="mrq-from">${eh(m.reply_from)}</div><div class="mrq-text">${eh((m.reply_text||'').substring(0,60))}</div>`;q.onclick=()=>scrollToMsg(m.reply_msg_id);bubble.appendChild(q);}
-    if(m.image_data&&m.image_data.startsWith('VIDEO:')){
+    if(m.image_data&&m.image_data.startsWith('VIDEOURL:')){
+      bubble.classList.add('vidnote-bubble');
+      bubble.appendChild(_buildVidnoteElUrl(m.id, m.image_data.slice(9)));
+    }else if(m.image_data&&m.image_data.startsWith('VIDEO:')){
       bubble.classList.add('vidnote-bubble');
       bubble.appendChild(_buildVidnoteEl(m.id, m.image_data.slice(6)));
     }else if(m.image_data&&m.image_data.startsWith('VOICE:')){
@@ -2984,6 +3001,55 @@ function _getOrCreateBlobUrl(msgId, dataUrl){
 // Legacy alias
 function b64ToBlobUrl(dataUrl){ return _getOrCreateBlobUrl('_tmp_'+Math.random(), dataUrl); }
 
+// Воспроизведение кружочка по прямой URL (Supabase Storage)
+function _buildVidnoteElUrl(msgId, videoUrl){
+  const wrap = document.createElement('div');
+  wrap.className = 'msg-vidnote-wrap';
+
+  const playBtn = document.createElement('div');
+  playBtn.className = 'msg-vidnote-play';
+  playBtn.innerHTML = '▶';
+  wrap.appendChild(playBtn);
+
+  const vid = document.createElement('video');
+  vid.className = 'msg-vidnote';
+  vid.loop = true;
+  vid.muted = true;
+  vid.playsInline = true;
+  vid.setAttribute('playsinline','');
+  vid.src = videoUrl;
+  vid.style.display = 'none';
+  wrap.insertBefore(vid, playBtn);
+
+  let playing = false;
+
+  vid.oncanplay = ()=>{ vid.style.display = 'block'; };
+  vid.onended = ()=>{ playing=false; wrap.classList.remove('msg-vidnote-playing'); playBtn.style.display='flex'; };
+
+  wrap.addEventListener('click', async e=>{
+    e.stopPropagation();
+    if(playing){
+      vid.pause(); playing=false;
+      wrap.classList.remove('msg-vidnote-playing');
+      playBtn.style.display='flex';
+      return;
+    }
+    try{
+      vid.muted = true;
+      await vid.play();
+      playing = true;
+      playBtn.style.display = 'none';
+      wrap.classList.add('msg-vidnote-playing');
+      try{ vid.muted = false; }catch(_){}
+    }catch(e){
+      toast('Ошибка: ' + e.message);
+    }
+  });
+
+  return wrap;
+}
+
+
 function _buildVidnoteEl(msgId, dataUrl){
   const wrap = document.createElement('div');
   wrap.className = 'msg-vidnote-wrap';
@@ -2994,78 +3060,90 @@ function _buildVidnoteEl(msgId, dataUrl){
   wrap.appendChild(playBtn);
 
   let vid = null;
-  let blobUrl = null;
+  let isPlaying = false;
+  let busy = false;
 
-  function makeBlobUrl(){
-    if(blobUrl) return blobUrl;
-    if(_mediaCache.has(msgId)){ blobUrl = _mediaCache.get(msgId).url; return blobUrl; }
-    try{
-      const comma = dataUrl.indexOf(',');
-      const mime = dataUrl.slice(5, dataUrl.indexOf(';')) || 'video/webm';
-      const b64 = dataUrl.slice(comma + 1);
-      const binStr = atob(b64);
-      const buf = new Uint8Array(binStr.length);
-      for(let i = 0; i < binStr.length; i++) buf[i] = binStr.charCodeAt(i);
-      const blob = new Blob([buf], {type: mime});
-      blobUrl = URL.createObjectURL(blob);
-      _mediaCache.set(msgId, {url: blobUrl});
-      return blobUrl;
-    }catch(e){
-      console.error('makeBlobUrl:', e);
-      return null;
-    }
-  }
+  async function toggle(){
+    if(busy) return;
+    busy = true;
 
-  playBtn.onclick = function(e){
-    e.stopPropagation();
-
-    // Pause if playing
-    if(vid && !vid.paused){
+    if(isPlaying && vid){
       vid.pause();
+      isPlaying = false;
       wrap.classList.remove('msg-vidnote-playing');
       playBtn.style.display = 'flex';
+      busy = false;
       return;
     }
 
-    // Create video element once
+    // Создаём video один раз
     if(!vid){
-      const url = makeBlobUrl();
-      if(!url){ toast('Ошибка загрузки видео'); return; }
+      playBtn.innerHTML = '⏳';
+
+      let url;
+      try{
+        if(_mediaCache.has(msgId)){
+          url = _mediaCache.get(msgId).url;
+        } else {
+          const resp = await fetch(dataUrl);
+          const blob = await resp.blob();
+          url = URL.createObjectURL(blob);
+          _mediaCache.set(msgId, {url});
+        }
+      }catch(err){
+        playBtn.innerHTML = '▶';
+        toast('Ошибка загрузки: ' + err.message);
+        busy = false;
+        return;
+      }
 
       vid = document.createElement('video');
       vid.className = 'msg-vidnote';
-      vid.src = url;
       vid.loop = true;
       vid.muted = true;
       vid.playsInline = true;
       vid.setAttribute('playsinline','');
+      vid.src = url;
       wrap.insertBefore(vid, playBtn);
-      vid.onclick = playBtn.onclick;
-      vid.onended = ()=>{ wrap.classList.remove('msg-vidnote-playing'); playBtn.style.display='flex'; };
+
+      vid.onended = ()=>{
+        isPlaying = false;
+        wrap.classList.remove('msg-vidnote-playing');
+        playBtn.style.display = 'flex';
+      };
+
+      // Ждём загрузки
+      if(vid.readyState < 3){
+        await new Promise(r=>{
+          vid.addEventListener('canplay', r, {once:true});
+          vid.addEventListener('error', r, {once:true});
+          setTimeout(r, 8000);
+        });
+      }
+      playBtn.innerHTML = '▶';
     }
 
-    // Play
-    playBtn.innerHTML = '⏳';
-    vid.play()
-      .then(()=>{
-        playBtn.style.display = 'none';
-        playBtn.innerHTML = '▶';
-        wrap.classList.add('msg-vidnote-playing');
-        try{ vid.muted = false; }catch(e){}
-      })
-      .catch(err=>{
-        playBtn.innerHTML = '▶';
-        console.error('vid.play() error:', err.name, err.message, '| readyState:', vid.readyState, '| error:', vid.error);
-        if(vid.error && vid.error.code === 4){
-          // Format not supported — show download
-          wrap.style.cssText = 'width:160px;height:160px;border-radius:50%;border:2px dashed rgba(229,57,53,.4);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;cursor:pointer;background:#100005;';
-          wrap.innerHTML = '<div style="font-size:28px">📥</div><div style="font-size:10px;color:#888;text-align:center;">Нажми для<br>скачивания</div>';
-          wrap.onclick = ()=>{ const a=document.createElement('a'); a.href=dataUrl; a.download='video.mp4'; a.click(); };
-        } else {
-          toast('Ошибка: ' + err.message);
-        }
-      });
-  };
+    // Запускаем
+    try{
+      vid.muted = true;
+      await vid.play();
+      isPlaying = true;
+      playBtn.style.display = 'none';
+      wrap.classList.add('msg-vidnote-playing');
+      try{ vid.muted = false; }catch(_){}
+    }catch(err){
+      isPlaying = false;
+      playBtn.style.display = 'flex';
+      playBtn.innerHTML = '▶';
+      toast('Ошибка: ' + err.message);
+    }
+
+    busy = false;
+  }
+
+  // ВАЖНО: только один обработчик, без дублирования на vid
+  playBtn.addEventListener('click', e=>{ e.stopPropagation(); toggle(); });
+  wrap.addEventListener('click', e=>{ e.stopPropagation(); toggle(); });
 
   return wrap;
 }
@@ -3189,7 +3267,10 @@ function renderGroupMsgs(scrollBottom=false){
     bubble.className = 'msg-bubble';
 
     // Media content
-    if(m.image_data && m.image_data.startsWith('VIDEO:')){
+    if(m.image_data && m.image_data.startsWith('VIDEOURL:')){
+      bubble.classList.add('vidnote-bubble');
+      bubble.appendChild(_buildVidnoteElUrl(m.id, m.image_data.slice(9)));
+    } else if(m.image_data && m.image_data.startsWith('VIDEO:')){
       bubble.classList.add('vidnote-bubble');
       bubble.appendChild(_buildVidnoteEl(m.id, m.image_data.slice(6)));
     } else if(m.image_data && m.image_data.startsWith('VOICE:')){
@@ -3888,52 +3969,71 @@ async function sendVidNote(){
   if(vidStream){ vidStream.getTracks().forEach(t=>t.stop()); vidStream=null; }
   $('vidnoteOverlay').classList.remove('on');
   toast('⏳ Отправка кружочка...');
-
-  const reader = new FileReader();
-  reader.onload = async e => {
-    let dataUrl = e.target.result;
-    // Проверяем что dataUrl корректный
-    if(!dataUrl || !dataUrl.includes(',')){ toast('Ошибка: видео не записалось'); return; }
-
-    try{
-      if(vidIsGroup){
-        if(!CG){ toast('Нет группы'); return; }
-        const rg = await fetch(`${SURL}/rest/v1/group_messages`, {
-          method:'POST',
-          headers:{...H,'Prefer':'return=minimal'},
-          body: JSON.stringify({
-            group_id: CG.id,
-            from_user: CU.id,
-            sender_name: CU.username,
-            text: '⭕ Кружочек',
-            image_data: 'VIDEO:' + dataUrl,
-            created_at: new Date().toISOString()
-          })
-        });
-        if(!rg.ok) throw new Error(await rg.text());
-        fetchGroupMsgs(true);
-      } else {
-        if(!CC){ toast('Нет чата'); return; }
-        const rv = await fetch(`${SURL}/rest/v1/messages`, {
-          method:'POST',
-          headers:{...H,'Prefer':'return=minimal'},
-          body: JSON.stringify({
-            from_user: CU.id,
-            to_user: CC.id,
-            text: '⭕ Кружочек',
-            image_data: 'VIDEO:' + dataUrl,
-            created_at: new Date().toISOString(),
-            read_by: []
-          })
-        });
-        if(!rv.ok) throw new Error(await rv.text());
-        fetchMsgs(true);
-      }
-      toast('✓ Кружочек отправлен');
-    }catch(err){ toast('Ошибка: '+err.message.slice(0,80)); }
-  };
-  reader.readAsDataURL(blob);
   vidChunks = []; vidRecorded = false;
+
+  try{
+    // Upload to Supabase Storage
+    const ext = mimeUsed.includes('mp4') ? 'mp4' : 'webm';
+    const fileName = `${CU.id}_${Date.now()}.${ext}`;
+    const uploadResp = await fetch(`${SURL}/storage/v1/object/videos/${fileName}`, {
+      method: 'POST',
+      headers: {
+        'apikey': SKEY,
+        'Authorization': 'Bearer ' + SKEY,
+        'Content-Type': mimeUsed,
+        'x-upsert': 'true',
+        'Cache-Control': '3600'
+      },
+      body: blob
+    });
+
+    if(!uploadResp.ok){
+      const errText = await uploadResp.text();
+      console.error('Storage upload error:', uploadResp.status, errText);
+      throw new Error('Storage upload failed (' + uploadResp.status + '): ' + errText.slice(0,120));
+    }
+
+    // Get public URL
+    const videoUrl = `${SURL}/storage/v1/object/public/videos/${fileName}`;
+
+    if(vidIsGroup){
+      if(!CG){ toast('Нет группы'); return; }
+      const rg = await fetch(`${SURL}/rest/v1/group_messages`, {
+        method:'POST',
+        headers:{...H,'Prefer':'return=minimal'},
+        body: JSON.stringify({
+          group_id: CG.id,
+          from_user: CU.id,
+          sender_name: CU.username,
+          text: '⭕ Кружочек',
+          image_data: 'VIDEOURL:' + videoUrl,
+          created_at: new Date().toISOString()
+        })
+      });
+      if(!rg.ok) throw new Error(await rg.text());
+      fetchGroupMsgs(true);
+    } else {
+      if(!CC){ toast('Нет чата'); return; }
+      const rv = await fetch(`${SURL}/rest/v1/messages`, {
+        method:'POST',
+        headers:{...H,'Prefer':'return=minimal'},
+        body: JSON.stringify({
+          from_user: CU.id,
+          to_user: CC.id,
+          text: '⭕ Кружочек',
+          image_data: 'VIDEOURL:' + videoUrl,
+          created_at: new Date().toISOString(),
+          read_by: []
+        })
+      });
+      if(!rv.ok) throw new Error(await rv.text());
+      fetchMsgs(true);
+    }
+    toast('✓ Кружочек отправлен');
+  }catch(err){
+    toast('Ошибка: ' + err.message.slice(0,100));
+    console.error('sendVidNote error:', err);
+  }
 }
 
 // ── VOICE in GROUP ──
